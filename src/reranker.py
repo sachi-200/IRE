@@ -31,6 +31,58 @@ FEATURE_COLS = [
     "session_click_count_before", "session_impressions_before", "avg_dwell_time_before",
     "position_ctr_prior", "position",
 ]
+# FEATURE_COLS above is the original Q2 feature set. It is frozen: the
+# Codabench submission scripts and run_serving_benchmark.py build exactly
+# these columns for results/reranker_<dataset>_model.txt.
+
+# `position` is where the candidate sat in the dataset's own logged in-view
+# list -- decided by the production system that collected the log, so a
+# fresh request can't have it before ranking (Q9: "features unavailable at
+# serving time"). Excluded from the improved set, kept only for the ablation.
+SERVING_UNAVAILABLE_COLS = ["position", "position_ctr_prior"]
+
+# per-candidate scores re-expressed RELATIVE to the rest of the impression's
+# candidates -- LambdaMART only ever compares candidates within one group,
+# so "best semantic match in this impression" is more useful than a raw
+# cosine whose scale drifts from user to user
+RELATIVE_SOURCE_COLS = ["semantic_score", "bm25_score", "popularity_prior_ctr",
+                        "hours_since_first_seen", "cum_impressions_prior",
+                        "impressions_prior_1h", "ctr_prior_24h"]
+RELATIVE_FEATURE_COLS = ["n_candidates"] + [
+    f"{c}_{kind}" for c in RELATIVE_SOURCE_COLS for kind in ("pct_rank", "z", "gap")]
+
+IMPROVED_FEATURE_COLS = (
+    [c for c in FEATURE_COLS if c not in SERVING_UNAVAILABLE_COLS]
+    + ["days_since_last_click", "hours_since_first_seen", "cum_impressions_prior", "cum_clicks_prior"]
+    + [f"{kind}_prior_{h}h" for h in (1, 24) for kind in ("clicks", "impressions", "ctr")]
+    + RELATIVE_FEATURE_COLS
+)
+
+# early-stopped LambdaMART for the improved set (the base set keeps the
+# original fixed 200-tree config so its numbers stay reproducible)
+IMPROVED_LGBM_PARAMS = dict(n_estimators=2000, learning_rate=0.03, num_leaves=63,
+                            min_child_samples=50, subsample=0.8, subsample_freq=1,
+                            colsample_bytree=0.8, reg_lambda=1.0)
+
+
+def add_impression_relative_features(df: pd.DataFrame, source_cols=RELATIVE_SOURCE_COLS) -> pd.DataFrame:
+    """Adds RELATIVE_FEATURE_COLS: for each source column, its percentile
+    rank within the impression (1.0 = highest), its z-score within the
+    impression, and its gap to the impression's maximum; plus the
+    impression's candidate count. Only uses the candidate set itself (known
+    before ranking), never labels. Call AFTER cap_top_k so the reranker sees
+    the same candidate set these were computed over."""
+    out = df.copy()
+    g = out.groupby("impression_id", observed=True)
+    out["n_candidates"] = g["article_id"].transform("size").astype(float)
+    for c in source_cols:
+        col = out[c].astype(float)
+        gc_ = col.groupby(out["impression_id"], observed=True)
+        mean, std, mx = gc_.transform("mean"), gc_.transform("std"), gc_.transform("max")
+        out[f"{c}_pct_rank"] = gc_.rank(ascending=False, pct=True, method="average")
+        out[f"{c}_z"] = ((col - mean) / std.replace(0, np.nan)).fillna(0.0).where(col.notna())
+        out[f"{c}_gap"] = col - mx
+    return out
 
 
 def build_bm25_index(articles: pd.DataFrame, dataset: str):
@@ -104,18 +156,30 @@ def _prepare_X(df: pd.DataFrame, feature_cols=FEATURE_COLS) -> pd.DataFrame:
     return X  # LightGBM handles remaining NaNs (e.g. MIND's freshness_hours) natively
 
 
-def train_ranker(train_df: pd.DataFrame, feature_cols=FEATURE_COLS, **lgbm_kwargs):
+def _grouped(df: pd.DataFrame, feature_cols):
+    df = df.sort_values("impression_id")  # LightGBM needs each group's rows contiguous
+    groups = df.groupby("impression_id", observed=True, sort=False).size().to_numpy()
+    return _prepare_X(df, feature_cols), df["clicked"].to_numpy(), groups
+
+
+def train_ranker(train_df: pd.DataFrame, feature_cols=FEATURE_COLS, valid_df: pd.DataFrame = None,
+                 early_stopping_rounds: int = 100, **lgbm_kwargs):
+    """valid_df (optional): a held-out slice of TRAIN impressions used only
+    to pick the number of trees (early stopping on nDCG@10) -- never the
+    val/test splits that metrics are reported on."""
     import lightgbm as lgb
-    train_df = train_df.sort_values("impression_id")  # LightGBM needs each group's rows contiguous
-    groups = train_df.groupby("impression_id", observed=True, sort=False).size().to_numpy()
-    X = _prepare_X(train_df, feature_cols)
-    y = train_df["clicked"].to_numpy()
+    X, y, groups = _grouped(train_df, feature_cols)
 
     params = dict(objective="lambdarank", metric="ndcg", n_estimators=200,
                   learning_rate=0.05, num_leaves=31, min_child_samples=20, verbosity=-1)
     params.update(lgbm_kwargs)
     ranker = lgb.LGBMRanker(**params)
-    ranker.fit(X, y, group=groups)
+    if valid_df is None:
+        ranker.fit(X, y, group=groups)
+    else:
+        Xv, yv, gv = _grouped(valid_df, feature_cols)
+        ranker.fit(X, y, group=groups, eval_set=[(Xv, yv)], eval_group=[gv], eval_at=[10],
+                   callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)])
     return ranker
 
 

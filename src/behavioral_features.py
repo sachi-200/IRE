@@ -32,6 +32,70 @@ def _decay_weight(age_days, half_life_days=RECENCY_HALF_LIFE_DAYS):
     return 0.5 ** (np.asarray(age_days, dtype=float) / half_life_days)
 
 
+def prepare_point_in_time_history(history: pd.DataFrame, impressions: pd.DataFrame,
+                                   include_in_window_clicks: bool = True) -> pd.DataFrame:
+    """Turn the parsed history table into a de-duplicated click log whose
+    timestamps are safe to cut at "strictly before this impression".
+
+    MIND: src/parse_mind.py stamps every item of a behaviors row's `history`
+    column with that ROW's impression time, and repeats the whole history
+    once per impression. Cut naively, a user's first impression then sees
+    an empty history (every copy is stamped at-or-after it) and later
+    impressions count the duplicated copies many times over. MIND's history
+    column is the user's pre-window clicks, known at every impression, so:
+      - keep one row per (user, article), at its FIRST appearance;
+      - items already in the user's first behaviors row are pre-window
+        clicks -> stamp them just before the dataset window;
+      - items that only show up in a later row keep that later row's time,
+        so no earlier impression can see them (conservative, never leaky).
+    EB-NeRD: history timestamps are real; only exact duplicates (the train/
+    and validation/ history files overlap) are dropped.
+
+    include_in_window_clicks: also append clicks observed in the impression
+    logs themselves (clicked == 1) at their own timestamp. The strict "<"
+    cut in compute_click_history_features means an impression still never
+    sees its own label, only clicks from strictly earlier impressions.
+
+    Returns columns dataset, user_id, article_id, timestamp, seq -- `seq`
+    preserves original order as a tie-breaker for same-timestamp items.
+    """
+    hist = history[["dataset", "user_id", "article_id", "timestamp"]].copy()
+    hist["seq"] = np.arange(len(hist), dtype=np.int64)
+    parts = []
+
+    is_mind = (hist["dataset"] == "mind").to_numpy()
+    if is_mind.any():
+        first = (hist[is_mind].groupby(["dataset", "user_id", "article_id"], observed=True, sort=False)
+                 .agg(timestamp=("timestamp", "min"), seq=("seq", "min")).reset_index())
+        mind_imp = impressions.loc[(impressions["dataset"] == "mind").to_numpy(), ["user_id", "timestamp"]]
+        user_first_imp = mind_imp.groupby("user_id", observed=True)["timestamp"].min()
+        user_first = user_first_imp.reindex(np.asarray(first["user_id"].astype(object))).to_numpy()
+        pre_window = mind_imp["timestamp"].min() - pd.Timedelta(days=1)
+        first.loc[first["timestamp"].to_numpy() <= user_first, "timestamp"] = pre_window
+        parts.append(first)
+        del mind_imp, user_first_imp, user_first
+    if (~is_mind).any():
+        parts.append(hist[~is_mind].drop_duplicates(["dataset", "user_id", "article_id", "timestamp"]))
+
+    if include_in_window_clicks:
+        clicks = impressions.loc[impressions["clicked"].to_numpy() == 1,
+                                 ["dataset", "user_id", "article_id", "timestamp"]].copy()
+        clicks["seq"] = len(hist) + np.arange(len(clicks), dtype=np.int64)
+        parts.append(clicks)
+    del hist
+
+    out = pd.concat(parts, ignore_index=True)
+    for col in ("dataset", "user_id", "article_id"):
+        out[col] = out[col].astype(object)
+    out = out.sort_values(["dataset", "user_id", "timestamp", "seq"], kind="stable")
+    out = out.drop_duplicates(["dataset", "user_id", "article_id", "timestamp"])
+    # a MIND in-window click can also reappear in a later row's history column
+    # (stamped later than the real click) -- keep only the earliest occurrence
+    dup_mind = (out["dataset"] == "mind").to_numpy() & out.duplicated(
+        ["dataset", "user_id", "article_id"], keep="first").to_numpy()
+    return out[~dup_mind].reset_index(drop=True)
+
+
 def compute_click_history_features(impressions: pd.DataFrame, history: pd.DataFrame,
                                     articles: pd.DataFrame,
                                     n_recent: int = N_RECENT_CLICKS,
@@ -45,7 +109,10 @@ def compute_click_history_features(impressions: pd.DataFrame, history: pd.DataFr
     attach_click_history_embeddings (needs data/features/embeddings_*.npz
     from Part I.3, which not every caller has built yet).
     """
-    hist = history.sort_values(["dataset", "user_id", "timestamp"])
+    # `seq` (from prepare_point_in_time_history) keeps same-timestamp items in
+    # their original order, so "the last n_recent" is well defined
+    sort_cols = ["dataset", "user_id", "timestamp"] + (["seq"] if "seq" in history.columns else [])
+    hist = history.sort_values(sort_cols, kind="stable")
     imp_unique = (impressions.drop_duplicates("impression_id")
                   [["impression_id", "dataset", "user_id", "timestamp"]])
 
@@ -190,6 +257,40 @@ def compute_session_features(impressions: pd.DataFrame,
                 "avg_dwell_time_before"]]
 
 
+POPULARITY_WINDOWS_HOURS = (1, 24)
+
+
+def _windowed_prior_counts(bucket: pd.DataFrame, windows_hours):
+    """bucket: indexed by (dataset, article_id, timestamp) with n_clicks /
+    n_impressions per bucket. Returns (sorted_index, {hours: (clicks,
+    impressions)}) -- arrays aligned with sorted_index, counting only
+    buckets with timestamp in [t - W, t).
+
+    Vectorized with prefix sums: buckets are laid out on one sorted int64
+    axis (article-group block offset + seconds), so the window start is a
+    single np.searchsorted over all buckets instead of a per-article loop.
+    """
+    bucket = bucket.sort_index()
+    ts = bucket.index.get_level_values("timestamp").asi8 // 10**9
+    gid = bucket.groupby(level=["dataset", "article_id"], observed=True, sort=False).ngroup().to_numpy()
+    t0 = ts.min() if len(ts) else 0
+    span = int(ts.max() - t0 + 1) if len(ts) else 1
+    # each article group owns a block of width 2*span; the +span offset keeps
+    # (t - W) inside the article's own block for any W <= span
+    key = gid.astype(np.int64) * (2 * span) + (ts - t0) + span
+    assert (np.diff(key) > 0).all(), "bucket keys must be strictly increasing"
+    cum_clicks = np.concatenate([[0], np.cumsum(bucket["n_clicks"].to_numpy())])
+    cum_impr = np.concatenate([[0], np.cumsum(bucket["n_impressions"].to_numpy())])
+    i = np.arange(len(key))
+
+    out = {}
+    for hours in windows_hours:
+        w = min(int(hours * 3600), span)
+        j = np.searchsorted(key, key - w, side="left")  # first bucket with ts >= t - W (same article)
+        out[hours] = (cum_clicks[i] - cum_clicks[j], cum_impr[i] - cum_impr[j])
+    return bucket.index, out
+
+
 def compute_article_dynamic_features(impressions: pd.DataFrame, articles: pd.DataFrame) -> pd.DataFrame:
     """One row per (impression_id, article_id) candidate: time-aware
     popularity-so-far and freshness. Call on the exploded impressions
@@ -224,6 +325,27 @@ def compute_article_dynamic_features(impressions: pd.DataFrame, articles: pd.Dat
     imp["cum_clicks_prior"] = cum_clicks_prior.reindex(bucket_key).to_numpy()
     imp["cum_impressions_prior"] = cum_impressions_prior.reindex(bucket_key).to_numpy()
     imp["popularity_prior_ctr"] = popularity_prior_ctr.reindex(bucket_key).to_numpy()
+
+    # short-term ("trending") popularity: clicks/impressions in the window
+    # [t - W, t), strictly before t like everything above. Cumulative CTR goes
+    # stale fast for news; these react to what's being clicked right now.
+    win_index, windows = _windowed_prior_counts(bucket, POPULARITY_WINDOWS_HOURS)
+    pos = win_index.get_indexer(bucket_key)  # every candidate's bucket exists, so no -1s
+    for hours, (clicks_w, impr_w) in windows.items():
+        imp[f"clicks_prior_{hours}h"] = clicks_w[pos].astype(np.float32)
+        imp[f"impressions_prior_{hours}h"] = impr_w[pos].astype(np.float32)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            imp[f"ctr_prior_{hours}h"] = np.where(
+                imp[f"impressions_prior_{hours}h"] > 0,
+                imp[f"clicks_prior_{hours}h"] / imp[f"impressions_prior_{hours}h"], np.nan).astype(np.float32)
+
+    # hours since the article was first shown to anyone: a publish-time proxy
+    # that also works for MIND (which ships no published_time). The minimum
+    # over ALL impressions is still leak-free -- every later impression has a
+    # timestamp > t, so min(all) == min(impressions at or before t).
+    first_seen = imp.groupby(["dataset", "article_id"], observed=True)["timestamp"].transform("min")
+    imp["hours_since_first_seen"] = (imp["timestamp"] - first_seen) / np.timedelta64(1, "h")
+    del first_seen
 
     # cast onto imp's exact categories: articles rows for article_ids that never
     # appear as a candidate become NaN here, which is fine -- a left-lookup from
@@ -292,7 +414,8 @@ def build_behavioral_features(impressions: pd.DataFrame, history: pd.DataFrame,
     candidate-set size, for no benefit (category_match/_frac already
     distill recent_categories down to a per-candidate scalar).
     """
-    click_hist = compute_click_history_features(impressions, history, articles)
+    click_hist = compute_click_history_features(
+        impressions, prepare_point_in_time_history(history, impressions), articles)
     if with_embeddings:
         click_hist = attach_click_history_embeddings(click_hist)
     session = compute_session_features(impressions)
@@ -349,6 +472,13 @@ def assert_no_leakage(behavioral: pd.DataFrame) -> None:
     AssertionError if any feature could see its own impression's future.
     Not a substitute for tests/test_behavioral_window.py's unit tests, but
     cheap enough to run every time the pipeline builds features."""
+    # every per-impression feature is keyed by impression_id -- if one id
+    # covers two real impressions (different user or time), one of them
+    # silently gets the other's history/session features
+    per_id = behavioral.groupby("impression_id", observed=True).agg(
+        n_users=("user_id", "nunique"), n_times=("timestamp", "nunique"))
+    assert (per_id["n_users"] <= 1).all() and (per_id["n_times"] <= 1).all(), \
+        "impression_id is not unique across source files (see src/parse_mind.py)"
     assert (behavioral["days_since_last_click"].dropna() >= 0).all(), \
         "found a 'last click' at or after its own impression's timestamp"
     assert (behavioral["freshness_hours"].dropna() >= 0).all(), \
@@ -356,3 +486,7 @@ def assert_no_leakage(behavioral: pd.DataFrame) -> None:
     assert (behavioral["n_clicks_before"] >= 0).all()
     assert (behavioral["cum_clicks_prior"] >= 0).all()
     assert (behavioral["cum_clicks_prior"] <= behavioral["cum_impressions_prior"]).all()
+    assert (behavioral["hours_since_first_seen"] >= 0).all()
+    for hours in POPULARITY_WINDOWS_HOURS:
+        assert (behavioral[f"clicks_prior_{hours}h"] <= behavioral[f"impressions_prior_{hours}h"]).all()
+        assert (behavioral[f"impressions_prior_{hours}h"] <= behavioral["cum_impressions_prior"]).all()

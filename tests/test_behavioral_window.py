@@ -12,7 +12,7 @@ import pytest
 from src.behavioral_features import (
     compute_click_history_features, compute_article_dynamic_features,
     compute_session_features, attach_category_match, attach_click_history_embeddings,
-    assert_no_leakage,
+    assert_no_leakage, prepare_point_in_time_history,
 )
 
 T = pd.Timestamp
@@ -159,3 +159,85 @@ def test_assert_no_leakage_passes_on_clean_synthetic_pipeline():
         session.drop(columns=["dataset", "user_id", "timestamp"]), on="impression_id")
 
     assert_no_leakage(behavioral)  # should not raise
+
+
+def _mind_parsed_history_and_impressions():
+    """Mimics what src/parse_mind.py produces: every behaviors row's
+    `history` column is re-stamped with THAT row's time and repeated per
+    impression. u1's history is [a1, a2] at both rows; a3 only appears in
+    the second row's history; u1 also clicks a3 in-window at 12:00."""
+    t1, t2 = T("2024-01-05 10:00"), T("2024-01-05 14:00")
+    history = pd.DataFrame(
+        [{"dataset": "mind", "user_id": "u1", "article_id": a, "timestamp": t1} for a in ("a1", "a2")]
+        + [{"dataset": "mind", "user_id": "u1", "article_id": a, "timestamp": t2} for a in ("a1", "a2", "a3")])
+    impressions = pd.DataFrame([
+        {"impression_id": "i1", "dataset": "mind", "user_id": "u1", "timestamp": t1,
+         "article_id": "a3", "clicked": 0, "position": 0},
+        {"impression_id": "iX", "dataset": "mind", "user_id": "u1", "timestamp": T("2024-01-05 12:00"),
+         "article_id": "a3", "clicked": 1, "position": 0},
+        {"impression_id": "i2", "dataset": "mind", "user_id": "u1", "timestamp": t2,
+         "article_id": "a1", "clicked": 0, "position": 0},
+    ])
+    articles = pd.DataFrame([{"dataset": "mind", "article_id": a, "category": "c", "title": a.upper(),
+                              "published_time": pd.NaT} for a in ("a1", "a2", "a3")])
+    return history, impressions, articles
+
+
+def test_mind_first_impression_sees_pre_window_history_without_duplicates():
+    history, impressions, articles = _mind_parsed_history_and_impressions()
+    feats = compute_click_history_features(
+        impressions, prepare_point_in_time_history(history, impressions), articles).set_index("impression_id")
+
+    # first impression: the pre-window history [a1, a2] is visible (naively cut it was empty)
+    assert feats.loc["i1", "n_clicks_before"] == 2
+    assert feats.loc["i1", "recent_article_ids"] == ["a1", "a2"]
+    # second impression: a1/a2 counted ONCE (not once per behaviors row), plus the
+    # in-window click on a3 at 12:00 -- which is also a3's only (deduped) occurrence
+    assert feats.loc["i2", "n_clicks_before"] == 3
+    assert feats.loc["i2", "recent_article_ids"] == ["a1", "a2", "a3"]
+
+
+def test_in_window_click_is_invisible_to_its_own_impression():
+    history, impressions, articles = _mind_parsed_history_and_impressions()
+    feats = compute_click_history_features(
+        impressions, prepare_point_in_time_history(history, impressions), articles).set_index("impression_id")
+    # iX is where a3 gets clicked -- that label must not leak into iX's own features
+    assert "a3" not in feats.loc["iX", "recent_article_ids"]
+    assert feats.loc["iX", "n_clicks_before"] == 2
+
+
+def test_windowed_popularity_counts_only_the_strictly_prior_window():
+    rows = [  # article a1: clicked at 08:00 and 09:30, shown unclicked at 09:45; queried at 10:00
+        ("i1", "a1", "2024-01-05 08:00", 1), ("i2", "a1", "2024-01-05 09:30", 1),
+        ("i3", "a1", "2024-01-05 09:45", 0), ("i4", "a1", "2024-01-05 10:00", 1),
+        ("i5", "a1", "2024-01-05 10:00", 0),  # same instant as i4: must not see i4's click
+        ("i6", "a2", "2024-01-05 09:59", 1),  # other article: never counted for a1
+    ]
+    impressions = pd.DataFrame([
+        {"impression_id": iid, "dataset": "toy", "user_id": f"u{n}", "article_id": aid,
+         "timestamp": T(ts), "clicked": c, "position": 0, "split": "train"}
+        for n, (iid, aid, ts, c) in enumerate(rows)])
+    out = compute_article_dynamic_features(impressions, _articles()).set_index("impression_id")
+    for iid in ("i4", "i5"):
+        assert out.loc[iid, "impressions_prior_1h"] == 2  # 09:30 and 09:45 (08:00 is outside 1h)
+        assert out.loc[iid, "clicks_prior_1h"] == 1
+        assert out.loc[iid, "impressions_prior_24h"] == 3
+        assert out.loc[iid, "clicks_prior_24h"] == 2
+    assert out.loc["i1", "impressions_prior_24h"] == 0  # nothing before the first showing
+    assert np.isnan(out.loc["i1", "ctr_prior_24h"])
+    assert out.loc["i6", "impressions_prior_24h"] == 0
+
+
+def test_hours_since_first_seen_ignores_future_impressions():
+    impressions = pd.DataFrame([
+        {"impression_id": "i1", "dataset": "toy", "user_id": "u1", "article_id": "a1",
+         "timestamp": T("2024-01-05 10:00"), "clicked": 0, "position": 0, "split": "train"},
+        {"impression_id": "i2", "dataset": "toy", "user_id": "u2", "article_id": "a1",
+         "timestamp": T("2024-01-05 16:00"), "clicked": 0, "position": 0, "split": "train"},
+        {"impression_id": "i3", "dataset": "toy", "user_id": "u3", "article_id": "a2",
+         "timestamp": T("2024-01-06 10:00"), "clicked": 0, "position": 0, "split": "val"},
+    ])
+    out = compute_article_dynamic_features(impressions, _articles()).set_index("impression_id")
+    assert out.loc["i1", "hours_since_first_seen"] == 0.0  # first time a1 is ever shown
+    assert out.loc["i2", "hours_since_first_seen"] == 6.0
+    assert out.loc["i3", "hours_since_first_seen"] == 0.0

@@ -29,7 +29,8 @@ import numpy as np
 import pandas as pd
 
 from src.config import PROCESSED_DIR, FEATURES_DIR, ROOT
-from src.reranker import build_bm25_index, build_semantic_index, add_retrieval_scores, cap_top_k, FEATURE_COLS
+from src.reranker import (build_bm25_index, build_semantic_index, add_retrieval_scores, cap_top_k,
+                          add_impression_relative_features, FEATURE_COLS, IMPROVED_FEATURE_COLS)
 from src.ranking_metrics import auc, mrr, ndcg_at_k
 from src.beyond_accuracy import intra_list_diversity, novelty, catalog_coverage
 from src.bootstrap import bootstrap_ci
@@ -137,13 +138,16 @@ def report_slice(label, sub_df, indent="    "):
     return metrics
 
 
-def run(dataset: str, k: int, primary_method: str, max_eval_impressions: int, catalog_size: int):
-    print(f"\n=== Q5 extended evaluation: {dataset} ===")
+def run(dataset: str, k: int, primary_method: str, max_eval_impressions: int, catalog_size: int,
+        feature_set: str = "improved"):
+    print(f"\n=== Q5 extended evaluation: {dataset} (feature set={feature_set}) ===")
     articles = pd.read_parquet(PROCESSED_DIR / "articles.parquet", filters=[("dataset", "==", dataset)])
     bm25_index, bm25_lookup = build_bm25_index(articles, dataset)
     semantic_index, id_to_embedding = build_semantic_index(articles, dataset)
     popularity, total_train_clicks = load_train_popularity(dataset)
-    booster = lgb.Booster(model_file=str(RESULTS_DIR / f"reranker_{dataset}_model.txt"))
+    suffix = "_improved" if feature_set == "improved" else ""
+    feature_cols = IMPROVED_FEATURE_COLS if feature_set == "improved" else FEATURE_COLS
+    booster = lgb.Booster(model_file=str(RESULTS_DIR / f"reranker_{dataset}{suffix}_model.txt"))
     primary_col = "bm25_score" if primary_method == "bm25" else "semantic_score"
 
     report = {}
@@ -154,8 +158,8 @@ def run(dataset: str, k: int, primary_method: str, max_eval_impressions: int, ca
         scored = add_retrieval_scores(behavioral, click_hist, bm25_index, bm25_lookup,
                                        semantic_index, id_to_embedding)
         capped = cap_top_k(scored, primary_col, k)
-        capped = capped.copy()
-        capped["reranker_score"] = booster.predict(prepare_X(capped))
+        capped = add_impression_relative_features(capped) if feature_set == "improved" else capped.copy()
+        capped["reranker_score"] = booster.predict(prepare_X(capped, feature_cols))
 
         per_imp, all_reclists = evaluate_full_pipeline(
             capped, popularity, total_train_clicks, id_to_embedding,
@@ -181,9 +185,9 @@ def run(dataset: str, k: int, primary_method: str, max_eval_impressions: int, ca
             "head_vs_tail": {"head": head, "tail": tail},
         }
 
-    with open(RESULTS_DIR / f"extended_eval_{dataset}_summary.json", "w") as f:
+    with open(RESULTS_DIR / f"extended_eval_{dataset}{suffix}_summary.json", "w") as f:
         json.dump(report, f, indent=2)
-    print(f"\n  saved results/extended_eval_{dataset}_summary.json")
+    print(f"\n  saved results/extended_eval_{dataset}{suffix}_summary.json")
     return report
 
 
@@ -193,6 +197,8 @@ def main():
     ap.add_argument("--k", type=int, default=150, help="top-K kept after Stage 1 retrieval (spec: 100-200)")
     ap.add_argument("--primary-method", choices=["bm25", "semantic"], default="semantic")
     ap.add_argument("--max-eval-impressions", type=int, default=3000)
+    ap.add_argument("--feature-set", choices=["improved", "base"], default="improved",
+                     help="which trained reranker to evaluate (run run_reranker.py with the same flag first)")
     args = ap.parse_args()
 
     datasets = ["mind", "ebnerd"] if args.dataset == "all" else [args.dataset]
@@ -200,7 +206,7 @@ def main():
         catalog_size = pd.read_parquet(
             PROCESSED_DIR / "articles.parquet", columns=["article_id"], filters=[("dataset", "==", ds)]
         ).shape[0]
-        run(ds, args.k, args.primary_method, args.max_eval_impressions, catalog_size)
+        run(ds, args.k, args.primary_method, args.max_eval_impressions, catalog_size, args.feature_set)
 
 
 if __name__ == "__main__":

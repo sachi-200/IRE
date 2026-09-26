@@ -49,11 +49,15 @@ def _load_behaviors(split_dir):
     # session_id or dwell-time signal (unlike EB-NeRD) -- keep the columns
     # for schema parity but leave them null; src/behavioral_features.py
     # derives session boundaries from a time-gap heuristic instead.
+    # MIND numbers impressions from 1 in EACH behaviors.tsv, so train/ and dev/
+    # reuse the same ids (every dev id collides with a train id). Prefix with
+    # the source folder so impression_id stays a unique key after concat.
     imp_rows = []
     for _, row in df.iterrows():
+        iid = f"{split_dir.name}-{row['impression_id']}"
         for pos, tok in enumerate(str(row["impressions"]).split()):
             aid, label = tok.rsplit("-", 1)
-            imp_rows.append((str(row["impression_id"]), "mind", str(row["user_id"]), row["time"],
+            imp_rows.append((iid, "mind", str(row["user_id"]), row["time"],
                               str(aid), int(label), pos, None, None))
     impressions_df = pd.DataFrame(imp_rows, columns=[
         "impression_id", "dataset", "user_id", "timestamp", "article_id", "clicked", "position",

@@ -8,7 +8,31 @@ Run with: pytest tests/test_reranker.py -q
 import numpy as np
 import pandas as pd
 
-from src.reranker import cap_top_k, evaluate_scores, train_ranker, score_ranker, FEATURE_COLS
+from src.reranker import (cap_top_k, evaluate_scores, train_ranker, score_ranker, FEATURE_COLS,
+                          IMPROVED_FEATURE_COLS, SERVING_UNAVAILABLE_COLS, add_impression_relative_features)
+
+
+def test_improved_feature_set_excludes_serving_unavailable_features():
+    assert not set(SERVING_UNAVAILABLE_COLS) & set(IMPROVED_FEATURE_COLS)
+    assert len(IMPROVED_FEATURE_COLS) == len(set(IMPROVED_FEATURE_COLS))
+
+
+def test_relative_features_are_computed_within_each_impression():
+    df = pd.DataFrame({
+        "impression_id": ["i1"] * 3 + ["i2"] * 2,
+        "article_id": list("abcde"),
+        "semantic_score": [0.9, 0.5, 0.1, 0.3, 0.3],
+        "bm25_score": [0.0] * 5, "popularity_prior_ctr": [np.nan, 0.2, 0.1, 0.0, 0.0],
+        "hours_since_first_seen": [1.0, 2.0, 3.0, 4.0, 5.0], "cum_impressions_prior": [0.0] * 5,
+        "impressions_prior_1h": [0.0] * 5, "ctr_prior_24h": [np.nan] * 5,
+    })
+    out = add_impression_relative_features(df).set_index("article_id")
+    assert out.loc["a", "semantic_score_pct_rank"] == 1 / 3  # best in i1 -> top rank
+    assert out.loc["a", "semantic_score_gap"] == 0.0
+    assert out.loc["c", "semantic_score_gap"] == -0.8
+    assert out.loc["a", "n_candidates"] == 3 and out.loc["d", "n_candidates"] == 2
+    assert out.loc["d", "semantic_score_z"] == 0.0  # tied impression -> zero spread, not NaN
+    assert np.isnan(out.loc["a", "popularity_prior_ctr_z"])  # missing input stays missing
 
 
 def test_cap_top_k_keeps_only_highest_scoring_candidates_per_impression():
