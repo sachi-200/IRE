@@ -1,4 +1,4 @@
-# NewsRecX — Scalable Personalized News Recommendation System
+# NewsRecX — Personalized News Recommendation System
 
 An end-to-end news recommendation system for the **MIND** and **EB-NeRD** datasets. The project combines lexical retrieval, semantic retrieval, behavioural features, learning-to-rank, neural news recommendation, evaluation, and large-scale prediction generation into a single reproducible pipeline.
 
